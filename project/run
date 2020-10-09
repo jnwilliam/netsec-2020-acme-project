@@ -1,6 +1,29 @@
 #!/usr/bin/python3
 import argparse
 import sys
+import requests
+from http import server
+
+
+class DnsServer:
+    def __init__(self):
+        pass
+
+
+class ChallengeHttpServer:
+    def __init__(self):
+        pass
+
+
+class CertificateHttpsServer:
+    def __init__(self):
+        pass
+
+
+class ShutdownHttpServer:
+    def __init__(self):
+        pass
+
 
 if __name__ == "__main__":
     # Parse arguments from command line
