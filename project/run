@@ -1,6 +1,30 @@
-#!/bin/bash
-DIRECTORY=$(dirname "$0")
-echo "Changing to ${DIRECTORY}"
-cd  "$DIRECTORY" || exit 1
+#!/usr/bin/python3
+import argparse
+import sys
 
-echo "Run your project here."
+if __name__ == "__main__":
+    # Parse arguments from command line
+    challenge_type = ""
+    acme_directory_url = ""
+    dns_record_ip_address = ""
+    domains = list()
+    revoke_certificate = False
+    parser = argparse.ArgumentParser()
+    challenge_type_parser = parser.add_subparsers(dest="challenge_type", help="ACME challenge type", required=True)
+    challenge_type_parsers = list()
+    challenge_type_parsers.append(challenge_type_parser.add_parser("dns01"))
+    challenge_type_parsers.append(challenge_type_parser.add_parser("http01"))
+    for ch_parser in challenge_type_parsers:
+        ch_parser.add_argument("--dir", help="Directory URL of the ACME server", required=True)
+        ch_parser.add_argument("--record", help="IPv4 address which will be returned by the DNS server", required=True)
+        ch_parser.add_argument("--domain", help="Domain for  which to request the certificate. "
+                               "Can be applied multiple times", action="append",
+                               required=True)
+        ch_parser.add_argument("--revoke", help="Immediately revoke the certificate after obtaining it",
+                               default=False, action="store_true", required=False)
+    args = parser.parse_args(sys.argv[1:])
+    challenge_type = args.challenge_type
+    acme_directory_url = args.dir
+    dns_record_ip_address = args.record
+    domains = args.domain
+    revoke_certificate = args.revoke
