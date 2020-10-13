@@ -3,26 +3,72 @@ import argparse
 import sys
 import requests
 from http import server
+import threading
+import socketserver
+import http
+from dnslib import *
+import time
+
+DNS_PORT = 10053
+CHALLENGE_SERVER_PORT = 5002
+CERTIFICATE_SERVER_PORT = 5001
+SHUTDOWN_SERVER_PORT = 5003
+
+DNS_TTL = 60 * 60
 
 
-class DnsServer:
-    def __init__(self):
-        pass
+dns_record_ip_address = "0.0.0.0"
+challenge_type = "dns01"
+acme_directory_url = "example_acme.com/dir"
+domains = ["example.com"]
+revoke = False
+shutdown = False
 
 
-class ChallengeHttpServer:
-    def __init__(self):
-        pass
+class AcmeClient:
+    pass
 
 
-class CertificateHttpsServer:
-    def __init__(self):
-        pass
+class DnsServerRequestHandler(socketserver.BaseRequestHandler):
+    def handle(self):
+        data = self.request[0].strip()
+        try:
+            print("DNS packet incoming...")
+            question = DNSRecord.parse(data)
+        except DNSError:
+            print("Error decoding DNS packet!")
+        else:
+            questioned_domain = question.get_q().get_qname().__str__()
+            answer = question.reply()
+            any_q = question.get_q().qtype == QTYPE.ANY
+            if question.get_q().qtype == QTYPE.A or any_q:
+                answer.add_answer(RR(questioned_domain, QTYPE.A, rdata=A(dns_record_ip_address), ttl=DNS_TTL))
+            reply = answer.pack()
+            self.request[1].sendto(reply, self.client_address)
 
 
-class ShutdownHttpServer:
-    def __init__(self):
-        pass
+class ChallengeHttpServer(http.server.BaseHTTPRequestHandler):
+    pass
+
+
+class CertificateHttpsServer(http.server.BaseHTTPRequestHandler):
+    pass
+
+
+class ShutdownHttpServer(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        global shutdown
+        if self.path == "/shutdown":
+            shutdown = True
+            self.send_response(200)
+            self.send_header("Content-type", "text/html")
+            self.end_headers()
+            self.wfile.write(bytes("Shutdown command received...", "utf-8"))
+        else:
+            self.send_response(200)
+            self.send_header("Content-type", "text/html")
+            self.end_headers()
+            self.wfile.write(bytes("This server is only for shutting down the other servers. Please use \"/shutdown\" to shut down the servers!", "utf-8"))
 
 
 if __name__ == "__main__":
@@ -51,3 +97,25 @@ if __name__ == "__main__":
     dns_record_ip_address = args.record
     domains = args.domain
     revoke_certificate = args.revoke
+
+    dns_server = socketserver.ThreadingUDPServer(("localhost", DNS_PORT), DnsServerRequestHandler)
+    challenge_http_server = socketserver.ThreadingTCPServer(("localhost", CHALLENGE_SERVER_PORT), ChallengeHttpServer)
+    certificate_https_server = socketserver.ThreadingTCPServer(("localhost", CERTIFICATE_SERVER_PORT), CertificateHttpsServer)
+    shutdown_http_server = socketserver.ThreadingTCPServer(("localhost", SHUTDOWN_SERVER_PORT), ShutdownHttpServer)
+
+    threads = [threading.Thread(target=dns_server.serve_forever),
+               threading.Thread(target=challenge_http_server.serve_forever),
+               threading.Thread(target=certificate_https_server.serve_forever),
+               threading.Thread(target=shutdown_http_server.serve_forever)]
+    for thread in threads:
+        thread.daemon = True
+        thread.start()
+
+    try:
+        while not shutdown:
+            time.sleep(0.1)
+    finally:
+        dns_server.shutdown()
+        challenge_http_server.shutdown()
+        certificate_https_server.shutdown()
+        shutdown_http_server.shutdown()
