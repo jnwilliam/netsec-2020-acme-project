@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 import argparse
 import sys
+import os
 import requests
 from http import server
 import threading
@@ -8,14 +9,22 @@ import socketserver
 import http
 from dnslib import *
 import time
+import ssl
+import base64
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives import hashes
 
 DNS_PORT = 10053
 CHALLENGE_SERVER_PORT = 5002
 CERTIFICATE_SERVER_PORT = 5001
 SHUTDOWN_SERVER_PORT = 5003
+ACME_SERVER_CERTIFICATE_LOCATION = os.path.join(os.getcwd(), "pebble.minica.pem")
 
 DNS_TTL = 60 * 60
-
 
 dns_record_ip_address = "0.0.0.0"
 challenge_type = "dns01"
@@ -23,10 +32,75 @@ acme_directory_url = "example_acme.com/dir"
 domains = ["example.com"]
 revoke = False
 shutdown = False
+public_key = None
+private_key = None
+
+
+def rsa_encrypt(key: rsa.RSAPublicKey, message: bytes):
+    return key.encrypt(message, padding=padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                                                     algorithm=hashes.SHA256(),
+                                                     label=None))
+
+
+def rsa_decrypt(key: rsa.RSAPrivateKey, message: bytes):
+    return key.decrypt(message, padding=padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                                                     algorithm=hashes.SHA256(),
+                                                     label=None))
 
 
 class AcmeClient:
-    pass
+    def __init__(self, directory_url: string, jws_algorith: string="ES256"):
+        r = requests.get(directory_url, verify=ACME_SERVER_CERTIFICATE_LOCATION)
+        print(r.text)
+        self.resources = r.json()
+        self.nonce = None
+        self.jws_algorithm = jws_algorith
+        self.jwk_private_key = None
+        self.jwk_public_key = None
+        self.account_url = None
+        self.get_new_nonce()
+        self.create_jwk()
+
+    def create_jwk(self):
+        if self.jws_algorithm == "ES256":
+            self.jwk_private_key = ec.generate_private_key(ec.SECP256R1())
+            self.jwk_public_key = self.jwk_private_key.public_key().public_bytes()
+        else:
+            raise RuntimeError("Unknown algorithm: " + self.jws_algorithm)
+
+    def create_jws_object(self, url: string, payload: dict, use_jwk: bool=False):
+        if not use_jwk and not self.account_url:
+            raise RuntimeError("Can't use kid, since you aren't logged in!")
+        header = {"alg": self.jws_algorithm,
+                  "nonce": self.nonce,
+                  "url": url}
+        if use_jwk:
+            header["jwk"] = self.jwk_public_key
+
+    def get_new_nonce(self):
+        r = requests.head(self.resources["newNonce"], verify=ACME_SERVER_CERTIFICATE_LOCATION)
+        self.nonce = r.headers["Replay-Nonce"]
+        print("Requested new nonce from server: " + self.nonce)
+
+    def create_account(self):
+        if not self.nonce:
+            self.get_new_nonce()
+        r = requests.post(self.resources["newAccount"],
+                          data={"nonce": self.nonce},
+                          headers={"Content-Type": "application/jose+json"},
+                          verify=ACME_SERVER_CERTIFICATE_LOCATION)
+        print(r.text)
+
+    def create_order(self):
+        r = requests.post(self.resources["newOrder"],
+                          data={"nonce": self.nonce},
+                          headers={"Content-Type": "application/jose+json"},
+                          verify=ACME_SERVER_CERTIFICATE_LOCATION)
+        print(r.text)
+
+    def create_signed_jwt(self):
+        pass
+
 
 
 class DnsServerRequestHandler(socketserver.BaseRequestHandler):
@@ -68,7 +142,9 @@ class ShutdownHttpServer(http.server.BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-type", "text/html")
             self.end_headers()
-            self.wfile.write(bytes("This server is only for shutting down the other servers. Please use \"/shutdown\" to shut down the servers!", "utf-8"))
+            self.wfile.write(bytes(
+                "This server is only for shutting down the other servers. Please use \"/shutdown\" to shut down the servers!",
+                "utf-8"))
 
 
 if __name__ == "__main__":
@@ -87,7 +163,7 @@ if __name__ == "__main__":
         ch_parser.add_argument("--dir", help="Directory URL of the ACME server", required=True)
         ch_parser.add_argument("--record", help="IPv4 address which will be returned by the DNS server", required=True)
         ch_parser.add_argument("--domain", help="Domain for  which to request the certificate. "
-                               "Can be applied multiple times", action="append",
+                                                "Can be applied multiple times", action="append",
                                required=True)
         ch_parser.add_argument("--revoke", help="Immediately revoke the certificate after obtaining it",
                                default=False, action="store_true", required=False)
@@ -100,8 +176,24 @@ if __name__ == "__main__":
 
     dns_server = socketserver.ThreadingUDPServer(("localhost", DNS_PORT), DnsServerRequestHandler)
     challenge_http_server = socketserver.ThreadingTCPServer(("localhost", CHALLENGE_SERVER_PORT), ChallengeHttpServer)
-    certificate_https_server = socketserver.ThreadingTCPServer(("localhost", CERTIFICATE_SERVER_PORT), CertificateHttpsServer)
+    certificate_https_server = socketserver.ThreadingTCPServer(("localhost", CERTIFICATE_SERVER_PORT),
+                                                               CertificateHttpsServer)
     shutdown_http_server = socketserver.ThreadingTCPServer(("localhost", SHUTDOWN_SERVER_PORT), ShutdownHttpServer)
+
+    # Generate private key / public key
+    private_key = rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=2048,
+        backend=default_backend()
+    )
+    public_key = private_key.public_key()
+
+    print(
+        "*************************************************************************************************************")
+    print("To shutdown the server open the site http://" + str(shutdown_http_server.server_address[0]) + ":" + str(
+        shutdown_http_server.server_address[1]) + "/shutdown")
+    print(
+        "*************************************************************************************************************")
 
     threads = [threading.Thread(target=dns_server.serve_forever),
                threading.Thread(target=challenge_http_server.serve_forever),
@@ -112,7 +204,12 @@ if __name__ == "__main__":
         thread.start()
 
     try:
+        client = AcmeClient(acme_directory_url)
+        client.get_new_nonce()
+        client.create_account()
+        client.create_order()
         while not shutdown:
+            shutdown = True
             time.sleep(0.1)
     finally:
         dns_server.shutdown()
