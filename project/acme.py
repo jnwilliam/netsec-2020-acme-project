@@ -37,6 +37,9 @@ shutdown = False
 public_key = None
 private_key = None
 
+http_key_auth = ""
+http_token = ""
+
 
 class DnsRecords:
     def __init__(
@@ -115,6 +118,7 @@ class AcmeClient:
         r, s = decode_dss_signature(self.jwk_private_key.sign(signature_content.encode("utf8"),
                                                               ec.ECDSA(hashes.SHA256())))
         signature = acme_base64_encoding(r.to_bytes(32, "big") + s.to_bytes(32, "big"))
+        print("Request: " + json.dumps({"url": header["url"], "payload": payload}))
         return json.dumps({"protected": header_base64url,
                            "payload": payload_base64url,
                            "signature": signature})
@@ -131,7 +135,10 @@ class AcmeClient:
             self.nonce = None
         r_json = r.json()
         r_headers = r.headers
-        if 400 <= r.status_code < 500:
+        print("    Headers: " + str(r_headers))
+        print("    Body: " + str(r_json))
+        print()
+        if r.status_code == 400 and r_json["type"] == "urn:ietf:params:acme:error:badNonce":
             print("Status code:", r.status_code, "- Retry (" + json.dumps(r_json) + ")")
             r_json, r_headers = self.create_signed_acme_request(url=url,
                                                                 payload=payload,
@@ -161,12 +168,12 @@ class AcmeClient:
         r = self.create_signed_acme_request(self.resources["newOrder"],
                                             payload=payload)
         self.order = r
-        print(r)
+        #print(r)
 
     def get_challenges(self):
         challenges = []
         for auth in self.order["authorizations"]:
-            challenge = self.create_signed_acme_request(auth, "")
+            challenge = self.create_signed_acme_request(auth, {})
             try:
                 wildcard = challenge["wildcard"]
             except KeyError:
@@ -184,7 +191,7 @@ class AcmeClient:
         else:
             raise ValueError("The challenge type " + challenge_type_name + " is unsupported")
         challenges = self.get_challenges()
-        print(challenges)
+        #print(challenges)
         cleaned_challenges = []
         for challenge in challenges:
             cleaned_challenge = {}
@@ -203,21 +210,36 @@ class AcmeClient:
     def perform_challenge(self):
         challenges = self.get_challenges_from_type(challenge_type)
         for challenge in challenges:
-            print(challenge)
+            #print(challenge)
+            public_key = {"crv": self.jwk_public_key["crv"],
+                          "x": self.jwk_public_key["x"],
+                          "y": self.jwk_public_key["y"]}
+            json_key_auth = json.dumps(public_key, sort_keys=True, separators=(",", ":"))
+            digest = hashes.Hash(hashes.SHA256())
+            digest.update(json_key_auth.encode("utf8"))
+            encoded_digest = acme_base64_encoding(digest.finalize())
+            key_auth = challenge["token"] + "." + encoded_digest
             if challenge["type"] == "dns-01":
-                json_key_auth = json.dumps(self.jwk_public_key, sort_keys=True, separators=(",", ":"))
                 digest = hashes.Hash(hashes.SHA256())
-                digest.update(json_key_auth.encode("utf8"))
-                encoded_digest = acme_base64_encoding(digest.finalize())
-                rdata = challenge["token"] + "." + encoded_digest
+                digest.update(key_auth.encode("utf8"))
+                encoded_rdata = acme_base64_encoding(digest.finalize())
                 dns_records.append(DnsRecords(QTYPE.TXT,
                                               "_acme-challenge." + challenge["domain"],
-                                              rdata))
+                                              encoded_rdata))
+            elif challenge["type"] == "http-01":
+                global http_token
+                global http_key_auth
+                http_token = challenge["token"]
+                http_key_auth = key_auth
             status = ""
+            max_retries = 5
             while status != "valid":
                 response = self.create_signed_acme_request(challenge["url"], {})
                 status = response["status"]
-                print(response)
+                #print(response)
+                #max_retries = max_retries - 1
+                if max_retries <= 0:
+                    raise StopIteration("Max retries reached!")
                 time.sleep(2)
 
 
@@ -245,7 +267,17 @@ class DnsServerRequestHandler(socketserver.BaseRequestHandler):
 
 
 class ChallengeHttpServer(http.server.BaseHTTPRequestHandler):
-    pass
+    def do_GET(self):
+        if self.path == "/.well-known/acme-challenge/" + http_token:
+            self.send_response(200)
+            self.send_header("Content-type", "application/octet-stream")
+            self.end_headers()
+            self.wfile.write(http_key_auth.encode("ascii"))
+        else:
+            self.send_response(200)
+            self.send_header("Content-type", "text/html")
+            self.end_headers()
+            self.wfile.write(bytes("http-token: " + http_token + "<br/> http_key_auth: " + http_key_auth, "utf8"))
 
 
 class CertificateHttpsServer(http.server.BaseHTTPRequestHandler):
