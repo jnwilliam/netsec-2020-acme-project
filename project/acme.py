@@ -1,6 +1,7 @@
 import argparse
 import sys
 import os
+from typing import Dict
 import requests
 from http import server
 import threading
@@ -55,18 +56,6 @@ class DnsRecords:
 dns_records = []
 
 
-def rsa_encrypt(key: rsa.RSAPublicKey, message: bytes):
-    return key.encrypt(message, padding=padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                                                     algorithm=hashes.SHA256(),
-                                                     label=None))
-
-
-def rsa_decrypt(key: rsa.RSAPrivateKey, message: bytes):
-    return key.decrypt(message, padding=padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                                                     algorithm=hashes.SHA256(),
-                                                     label=None))
-
-
 def acme_base64_encoding(data):
     if isinstance(data, str):
         data = data.encode("utf8")
@@ -89,8 +78,7 @@ class AcmeClient:
 
     def create_jwk(self):
         if self.jws_algorithm == "ES256":
-            if self.jwk_private_key is None:
-                self.jwk_private_key = ec.generate_private_key(ec.SECP256R1())
+            self.jwk_private_key = ec.generate_private_key(ec.SECP256R1())
             x = acme_base64_encoding(self.jwk_private_key.public_key().public_numbers().x.to_bytes(32, "big"))
             y = acme_base64_encoding(self.jwk_private_key.public_key().public_numbers().y.to_bytes(32, "big"))
             self.jwk_public_key = {"kty": "EC",
@@ -118,48 +106,51 @@ class AcmeClient:
         r, s = decode_dss_signature(self.jwk_private_key.sign(signature_content.encode("utf8"),
                                                               ec.ECDSA(hashes.SHA256())))
         signature = acme_base64_encoding(r.to_bytes(32, "big") + s.to_bytes(32, "big"))
-        print("Request: " + json.dumps({"url": header["url"], "payload": payload}))
+        #print("Request Body: " + json.dumps({"header": header, "payload": payload}))
         return json.dumps({"protected": header_base64url,
                            "payload": payload_base64url,
                            "signature": signature})
 
-    def create_signed_acme_request(self, url: string, payload, use_jwk: bool = False, return_header: bool = False):
+    def create_signed_acme_request(self,
+                                   url: string,
+                                   payload,
+                                   use_jwk: bool = False,
+                                   return_header: bool = False,
+                                   additional_headers: Dict[str, str] = None):
         request = self.create_jws_object(url=url, payload=payload, use_jwk=use_jwk)
+        headers = {"Content-Type": "application/jose+json"}
+        if additional_headers:
+            headers.update(additional_headers)
+        #print("Request Header: " + str(headers))
         r = requests.post(url=url,
                           data=request,
                           verify=ACME_SERVER_CERTIFICATE_LOCATION,
-                          headers={"Content-Type": "application/jose+json"})
+                          headers=headers)
         try:
             self.nonce = r.headers["Replay-Nonce"]
         except KeyError:
             self.nonce = None
-        r_json = r.json()
-        r_headers = r.headers
-        print("    Headers: " + str(r_headers))
-        print("    Body: " + str(r_json))
-        print()
-        if r.status_code == 400 and r_json["type"] == "urn:ietf:params:acme:error:badNonce":
-            print("Status code:", r.status_code, "- Retry (" + json.dumps(r_json) + ")")
-            r_json, r_headers = self.create_signed_acme_request(url=url,
-                                                                payload=payload,
-                                                                use_jwk=use_jwk,
-                                                                return_header=True)
-        if return_header:
-            return r_json, r_headers
-        else:
-            return r_json
+        #print("    Headers: " + str(r_headers))
+        #print("    Body: " + str(r_json))
+        #print()
+        if r.status_code == 400 and r.json()["type"] == "urn:ietf:params:acme:error:badNonce":
+            print("Status code:", r.status_code, "- Retry (" + json.dumps(r.json()) + ")")
+            r = self.create_signed_acme_request(url=url,
+                                                payload=payload,
+                                                use_jwk=use_jwk,
+                                                return_header=True)
+        return r
 
     def get_new_nonce(self):
         r = requests.head(self.resources["newNonce"], verify=ACME_SERVER_CERTIFICATE_LOCATION)
         self.nonce = r.headers["Replay-Nonce"]
-        print("Requested new nonce from server: " + self.nonce)
+        #print("Requested new nonce from server: " + self.nonce)
 
     def create_account(self):
         r = self.create_signed_acme_request(self.resources["newAccount"],
                                             payload={"termsOfServiceAgreed": True},
-                                            use_jwk=True,
-                                            return_header=True)
-        self.account_url = r[1]["Location"]
+                                            use_jwk=True)
+        self.account_url = r.headers["Location"]
 
     def create_order(self):
         payload = {"identifiers": []}
@@ -167,80 +158,59 @@ class AcmeClient:
             payload["identifiers"].append({"type": "dns", "value": domain})
         r = self.create_signed_acme_request(self.resources["newOrder"],
                                             payload=payload)
-        self.order = r
+        self.order = r.json()
         #print(r)
 
-    def get_challenges(self):
+    def get_challenges(self) -> list:
         challenges = []
         for auth in self.order["authorizations"]:
-            challenge = self.create_signed_acme_request(auth, {})
-            try:
-                wildcard = challenge["wildcard"]
-            except KeyError:
-                wildcard = False
-            challenges.append({"domain": challenge["identifier"]["value"],
-                               "wildcard": wildcard,
-                               "challenges": challenge["challenges"]})
+            challenge = self.create_signed_acme_request(auth, {}).json()
+            challenges.append(challenge)
         return challenges
 
-    def get_challenges_from_type(self, challenge_type_name: string = "dns01"):
-        if challenge_type_name in ["dns01", "dns-01"]:
-            challenge_type_name = "dns-01"
-        elif challenge_type_name in ["http01", "http-01"]:
-            challenge_type_name = "http-01"
-        else:
-            raise ValueError("The challenge type " + challenge_type_name + " is unsupported")
-        challenges = self.get_challenges()
-        #print(challenges)
-        cleaned_challenges = []
-        for challenge in challenges:
-            cleaned_challenge = {}
-            for type in challenge["challenges"]:
-                if type["type"] == challenge_type_name:
-                    cleaned_challenge["type"] = challenge_type_name
-                    cleaned_challenge["url"] = type["url"]
-                    cleaned_challenge["domain"] = challenge["domain"]
-                    cleaned_challenge["wildcard"] = challenge["wildcard"]
-                    cleaned_challenge["token"] = type["token"]
-                    cleaned_challenge["status"] = type["status"]
-                    cleaned_challenges.append(cleaned_challenge)
-                    break
-        return cleaned_challenges
-
-    def perform_challenge(self):
-        challenges = self.get_challenges_from_type(challenge_type)
-        for challenge in challenges:
-            #print(challenge)
-            public_key = {"crv": self.jwk_public_key["crv"],
-                          "x": self.jwk_public_key["x"],
-                          "y": self.jwk_public_key["y"]}
-            json_key_auth = json.dumps(public_key, sort_keys=True, separators=(",", ":"))
+    def jwk_thumbprint(self) -> str:
+        if self.jws_algorithm == "ES256":
+            json_key_auth = json.dumps(self.jwk_public_key, sort_keys=True, separators=(",", ":"))
             digest = hashes.Hash(hashes.SHA256())
             digest.update(json_key_auth.encode("utf8"))
-            encoded_digest = acme_base64_encoding(digest.finalize())
-            key_auth = challenge["token"] + "." + encoded_digest
-            if challenge["type"] == "dns-01":
-                digest = hashes.Hash(hashes.SHA256())
-                digest.update(key_auth.encode("utf8"))
-                encoded_rdata = acme_base64_encoding(digest.finalize())
-                dns_records.append(DnsRecords(QTYPE.TXT,
-                                              "_acme-challenge." + challenge["domain"],
-                                              encoded_rdata))
-            elif challenge["type"] == "http-01":
-                global http_token
-                global http_key_auth
-                http_token = challenge["token"]
-                http_key_auth = key_auth
-            status = ""
-            max_retries = 5
-            while status != "valid":
-                response = self.create_signed_acme_request(challenge["url"], {})
-                status = response["status"]
-                #print(response)
-                #max_retries = max_retries - 1
-                if max_retries <= 0:
-                    raise StopIteration("Max retries reached!")
-                time.sleep(2)
+            thumbprint = acme_base64_encoding(digest.finalize())
+            return thumbprint
+
+    def key_auth(self, token: str) -> str:
+        return token + '.' + self.jwk_thumbprint()
+
+    def hashed_key_auth(self, token: str) -> str:
+        digest = hashes.Hash(hashes.SHA256())
+        digest.update(self.key_auth(token).encode("utf8"))
+        hashed_key_auth = acme_base64_encoding(digest.finalize())
+        return hashed_key_auth
+
+    def perform_challenge(self):
+        challenges = self.get_challenges()
+        for challenge in challenges:
+            for challtype in challenge["challenges"]:
+                if challtype["type"] == "dns-01" and challenge_type == "dns01":
+                    dns_records.append(DnsRecords(QTYPE.TXT,
+                                                  "_acme-challenge." + challenge["identifier"]["value"],
+                                                  self.hashed_key_auth(challtype["token"])))
+                elif challtype["type"] == "http-01" and challenge_type == "http01":
+                    global http_token
+                    global http_key_auth
+                    http_token = challtype["token"]
+                    http_key_auth = self.key_auth(challtype["token"])
+                else:
+                    continue
+                status = ""
+                max_retries = 5
+                while status not in ["valid", "invalid"]:
+                    response = self.create_signed_acme_request(challtype["url"], {}).json()
+                    status = response["status"]
+                    print(json.dumps(response, indent=4))
+                    print("***********************************************************************")
+                    #max_retries = max_retries - 1
+                    if max_retries <= 0:
+                        raise StopIteration("Max retries reached!")
+                    time.sleep(2)
 
 
 class DnsServerRequestHandler(socketserver.BaseRequestHandler):
