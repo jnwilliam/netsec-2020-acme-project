@@ -1,3 +1,4 @@
 #!/bin/bash
 
-python3 -m pip install requests cryptography dnslib
+apt install -y python3.8
+python3.8 -m pip install requests cryptography dnslib
