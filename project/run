@@ -20,6 +20,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives import hashes
+from hashlib import sha256
 
 DNS_PORT = 10053
 CHALLENGE_SERVER_PORT = 5002
@@ -133,7 +134,7 @@ class AcmeClient:
         r_json = r.json()
         r_headers = r.headers
         if 400 <= r.status_code < 500:
-            print("Status code:", r.status_code, "- Retry")
+            print("Status code:", r.status_code, "- Retry (" + json.dumps(r_json) + ")")
             r_json, r_headers = self.create_signed_acme_request(url=url,
                                                                 payload=payload,
                                                                 use_jwk=use_jwk,
@@ -183,7 +184,7 @@ class AcmeClient:
         elif challenge_type_name in ["http01", "http-01"]:
             challenge_type_name = "http-01"
         else:
-            raise ValueError(f"The challenge type {challenge_type_name} is unsupported")
+            raise ValueError("The challenge type " + challenge_type_name + " is unsupported")
         challenges = self.get_challenges()
         print(challenges)
         cleaned_challenges = []
@@ -206,7 +207,7 @@ class AcmeClient:
         for challenge in challenges:
             print(challenge)
             if challenge["type"] == "dns-01":
-                json_key_auth = json.dumps(self.jwk_public_key, sort_keys=True)
+                json_key_auth = json.dumps(self.jwk_public_key, sort_keys=True, separators=(",", ":"))
                 digest = hashes.Hash(hashes.SHA256())
                 digest.update(json_key_auth.encode("utf8"))
                 encoded_digest = acme_base64_encoding(digest.finalize())
@@ -218,8 +219,8 @@ class AcmeClient:
             while status != "valid":
                 response = self.create_signed_acme_request(challenge["url"], {})
                 status = response["status"]
-                print(status)
-                time.sleep(0.5)
+                print(response)
+                time.sleep(2)
 
 
 class DnsServerRequestHandler(socketserver.BaseRequestHandler):
