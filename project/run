@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/python37
 import argparse
 import sys
 import os
@@ -20,7 +20,6 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives import hashes
-from hashlib import sha256
 
 DNS_PORT = 10053
 CHALLENGE_SERVER_PORT = 5002
