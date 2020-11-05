@@ -409,6 +409,14 @@ class AcmeClient(AcmeRequest):
             certs.append(order.finalize_order(csr))
         return certs
 
+    def revoke(
+            self,
+            cert: x509.Certificate
+    ):
+        cert_64 = Jose.base64_enc(cert.public_bytes(encoding=serialization.Encoding.DER))
+        payload = {"certificate": cert_64}
+        self._post(self.directory.get_revoke_cert(), payload=payload, kid=self.kid)
+
 
 class AcmeOrder:
     def __init__(
@@ -807,6 +815,8 @@ if __name__ == "__main__":
                                                           keyfile="private.pem",
                                                           certfile="cert.pem",
                                                           server_side=True)
+        if revoke_certificate:
+            client.revoke(cert)
         while not shutdown:
             time.sleep(0.1)
     finally:
