@@ -1,8 +1,9 @@
 import argparse
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, Union, List
 import requests
+import ssl
 from http import server
 import threading
 import socketserver
@@ -16,6 +17,10 @@ from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives import serialization
+from cryptography import x509
+from cryptography.x509.oid import NameOID
 from cryptography.hazmat.primitives import hashes
 
 DNS_PORT = 10053
@@ -392,9 +397,16 @@ class AcmeClient(AcmeRequest):
                               payload=payload, kid=self.kid)
         self.orders.append(AcmeOrder(account_creation_response=response, client=self))
 
-    def process_orders(self, challenge_type: str = "dns-01"):
-        for order in self.orders:
+    def process_orders(
+            self,
+            csrs: List[x509.CertificateSigningRequest],
+            challenge_type: str = "dns-01"
+    ) -> List[x509.Certificate]:
+        certs: List[x509.Certificate] = []
+        for order, csr in zip(self.orders, csrs):
             order.fullfill_order(challenge_type=challenge_type)
+            certs.append(order.finalize_order(csr))
+        return certs
 
 
 class AcmeOrder:
@@ -423,10 +435,44 @@ class AcmeOrder:
         for authorization_url in self.authorization_urls:
             self.authorizations.append(AcmeAuthorization(authorization_url=authorization_url, client=self.client))
 
-    def fullfill_order(self, challenge_type: str = "dns-01"):
+    def fullfill_order(
+            self,
+            challenge_type: str = "dns-01"
+    ):
         for authorization in self.authorizations:
             authorization.get_challenge(type_=challenge_type)
             authorization.perform_challenge(type_=challenge_type)
+
+    def finalize_order(
+            self,
+            csr: x509.CertificateSigningRequest
+    ) -> x509.Certificate:
+        csr_64 = Jose.base64_enc(csr.public_bytes(encoding=serialization.Encoding.DER))
+        payload = {"csr": csr_64}
+        self.client._post(self.finalize_url, payload=payload, kid=self.client.kid)
+        cert_url = self.poll_finalize()
+        response = self.client._post_as_get(cert_url, kid=self.client.kid)
+        cert = x509.load_pem_x509_certificate(response.text.encode("utf8"), backend=default_backend())
+        return cert
+
+    def poll_finalize(
+            self,
+            max_retries: int = 10,
+            poll_interval: int = 2
+    ) -> str:
+        finalize_done = False
+        for i in range(max_retries):
+            time.sleep(poll_interval)
+            response = self.client._post_as_get(url=self.order_url, kid=self.client.kid).json()
+            logger.log("{} Response: {}".format(i, response))
+            if response["status"] in ["valid", "invalid"]:
+                logger.log("Finalization is {}".format(response["status"]))
+                finalize_done = True
+                if response["status"] != "valid":
+                    raise AcmeException("Finalization invalid!")
+                return response["certificate"]
+        if not finalize_done:
+            raise AcmeException("Failed to finalize order!")
 
 
 class AcmeAuthorization:
@@ -595,15 +641,21 @@ class ChallengeHttpServer(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(http_key_auth.encode("ascii"))
         else:
-            self.send_response(200)
+            self.send_response(404)
             self.send_header("Content-type", "text/html")
             self.end_headers()
-            self.wfile.write(bytes("http-token: " + http_token + "<br/> http_key_auth: " + http_key_auth, "utf8"))
+            self.wfile.write("Error: Resource not found!".encode("utf8"))
 
 
 class CertificateHttpsServer(http.server.BaseHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/html")
+        self.end_headers()
+        self.wfile.write("This is some sample content at the path {}".format(self.path).encode("utf8"))
 
 
 class ShutdownHttpServer(http.server.BaseHTTPRequestHandler):
@@ -670,7 +722,54 @@ if __name__ == "__main__":
         key_size=2048,
         backend=default_backend()
     )
-    public_key = private_key.public_key()
+
+    dns_names: [x509.DNSName] = []
+    for domain in domains:
+        dns_names.append(x509.DNSName(domain))
+    subject = issuer = x509.Name([
+        x509.NameAttribute(NameOID.COUNTRY_NAME, u"CH"),
+        x509.NameAttribute(NameOID.STATE_OR_PROVINCE_NAME, u"Zürich"),
+        x509.NameAttribute(NameOID.LOCALITY_NAME, u"Zürich"),
+        x509.NameAttribute(NameOID.ORGANIZATION_NAME, u"ETH Zürich"),
+        x509.NameAttribute(NameOID.COMMON_NAME, u"williamj"),
+    ])
+    cert = x509.CertificateBuilder().subject_name(
+        subject
+    ).issuer_name(
+        issuer
+    ).public_key(
+        private_key.public_key()
+    ).serial_number(
+        x509.random_serial_number()
+    ).not_valid_before(
+        datetime.utcnow()
+    ).not_valid_after(
+        datetime.utcnow() + timedelta(days=90)
+    ).add_extension(
+        x509.SubjectAlternativeName(dns_names),
+        critical=False
+    ).sign(private_key, hashes.SHA256())
+
+    csr = x509.CertificateSigningRequestBuilder().subject_name(
+        subject
+    ).add_extension(
+        x509.SubjectAlternativeName(dns_names),
+        critical=False
+    ).sign(private_key, hashes.SHA256())
+
+    #Write all pems to disc
+    with open("private.pem", "wb") as f:
+        f.write(private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption()
+        ))
+
+    with open("cert.pem", "wb") as f:
+        f.write(cert.public_bytes(serialization.Encoding.PEM))
+
+    with open("csr.pem", "wb") as f:
+        f.write(csr.public_bytes(serialization.Encoding.PEM))
 
     print(
         "*************************************************************************************************************")
@@ -678,6 +777,13 @@ if __name__ == "__main__":
         shutdown_http_server.server_address[1]) + "/shutdown")
     print(
         "*************************************************************************************************************")
+
+    # SSL for CertificateHttpsServer
+    certificate_https_server.socket = ssl.wrap_socket(certificate_https_server.socket,
+                                                      keyfile="private.pem",
+                                                      certfile="cert.pem",
+                                                      server_side=True)
+
 
     threads = [threading.Thread(target=dns_server.serve_forever),
                threading.Thread(target=challenge_http_server.serve_forever),
@@ -690,9 +796,14 @@ if __name__ == "__main__":
         client = AcmeClient(acme_directory_url, Jose("ES256"))
         client.create_account()
         client.create_order(domains_to_be_ordered=domains)
-        client.process_orders(challenge_type=challenge_type)
+        cert = client.process_orders(challenge_type=challenge_type, csrs=[csr])[0]
+        with open("cert.pem", "wb") as f:
+            f.write(cert.public_bytes(serialization.Encoding.PEM))
+        certificate_https_server.socket = ssl.wrap_socket(certificate_https_server.socket,
+                                                          keyfile="private.pem",
+                                                          certfile="cert.pem",
+                                                          server_side=True)
         while not shutdown:
-            shutdown = True
             time.sleep(0.1)
     finally:
         dns_server.shutdown()
