@@ -283,11 +283,12 @@ class AcmeRequest:
         body = json.dumps(self.account.create_jose(payload=payload, additional_headers=jose_headers, kid=kid))
         headers.update({"Content-Type": "application/jose+json"})
         response = requests.post(url=url, data=body, headers=headers, verify=ACME_SERVER_CERTIFICATE_LOCATION)
+        self.nonce = response.headers["Replay-Nonce"]
         logger.log("POST {} - {}".format(url, response.status_code))
         try:
             self._handle(response)
         except BadNonce:
-            response = self._post(url=url, payload=payload, headers=headers)
+            response = self._post(url=url, payload=payload, jose_headers=jose_headers, kid=kid, headers=headers)
         return response
 
     def _post_as_get(
@@ -301,6 +302,7 @@ class AcmeRequest:
             headers = {}
         headers.update({"Content-Type": "application/jose+json"})
         response = self._post(url=url, payload=None, jose_headers=jose_headers, kid=kid, headers=headers)
+        self.nonce = response.headers["Replay-Nonce"]
         return response
 
     def _get(
@@ -335,7 +337,6 @@ class AcmeRequest:
             response: requests.Response,
             error_urn_space: str = "urn:ietf:params:acme:error:"
     ):
-        self.nonce = response.headers["Replay-Nonce"]
         if 200 <= response.status_code < 300:
             return
         try:
@@ -652,10 +653,13 @@ class CertificateHttpsServer(http.server.BaseHTTPRequestHandler):
         super().__init__(*args, **kwargs)
 
     def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/html")
-        self.end_headers()
-        self.wfile.write("This is some sample content at the path {}".format(self.path).encode("utf8"))
+        try:
+            self.send_response(200)
+            self.send_header("Content-type", "text/html")
+            self.end_headers()
+            self.wfile.write("This is some sample content at the path {}".format(self.path).encode("utf8"))
+        except Exception:
+            logger.log("CertificateHttpsServer: Something went wrong!")
 
 
 class ShutdownHttpServer(http.server.BaseHTTPRequestHandler):
