@@ -21,7 +21,6 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives import serialization
 from cryptography import x509
 from cryptography.x509.oid import NameOID
-from cryptography.hazmat.primitives import hashes
 
 DNS_PORT = 10053
 CHALLENGE_SERVER_PORT = 5002
@@ -53,6 +52,10 @@ class ServerImplementationError(AcmeException):
 
 
 class ResourceNotAvailable(AcmeException):
+    pass
+
+
+class AcmeInvalidAuthorization(AcmeException):
     pass
 
 
@@ -367,7 +370,8 @@ class AcmeClient(AcmeRequest):
     ):
         super().__init__(directory_url, account)
         self.kid: Union[str, None] = None
-        self.orders: List[AcmeOrder] = []
+        self.order: Union[AcmeOrder, None] = None
+        self.domains_to_be_ordered: List[str] = []
 
     def create_account(
             self,
@@ -391,23 +395,26 @@ class AcmeClient(AcmeRequest):
                      ):
         if len(domains_to_be_ordered) == 0:
             raise ValueError("There must be at least one domain in the order!")
+        self.domains_to_be_ordered = domains_to_be_ordered
         payload = {"identifiers": []}
         for domain in domains_to_be_ordered:
             payload["identifiers"].append({"type": "dns", "value": domain})
         response = self._post(url=self.directory.get_new_order(),
                               payload=payload, kid=self.kid)
-        self.orders.append(AcmeOrder(account_creation_response=response, client=self))
+        self.order = AcmeOrder(account_creation_response=response, client=self)
 
     def process_orders(
             self,
-            csrs: List[x509.CertificateSigningRequest],
+            csr: x509.CertificateSigningRequest,
             challenge_type: str = "dns-01"
-    ) -> List[x509.Certificate]:
-        certs: List[x509.Certificate] = []
-        for order, csr in zip(self.orders, csrs):
-            order.fullfill_order(challenge_type=challenge_type)
-            certs.append(order.finalize_order(csr))
-        return certs
+    ) -> x509.Certificate:
+        try:
+            self.order.fullfill_order(challenge_type=challenge_type)
+            cert = self.order.finalize_order(csr)
+        except AcmeInvalidAuthorization:
+            self.create_order(self.domains_to_be_ordered)
+            cert = self.process_orders(csr, challenge_type)
+        return cert
 
     def revoke(
             self,
@@ -473,10 +480,8 @@ class AcmeOrder:
         for i in range(max_retries):
             time.sleep(poll_interval)
             response = self.client._post_as_get(url=self.order_url, kid=self.client.kid).json()
-            logger.log("{} Response: {}".format(i, response))
             if response["status"] in ["valid", "invalid"]:
                 logger.log("Finalization is {}".format(response["status"]))
-                finalize_done = True
                 if response["status"] != "valid":
                     raise AcmeException("Finalization invalid!")
                 return response["certificate"]
@@ -520,6 +525,7 @@ class AcmeAuthorization:
         self._respond_to_challenge(challenge["url"])
         self.poll_status(max_retries=10, poll_interval=2)
 
+
     def _respond_to_challenge(self, challenge_url: str):
         if self.challenge is None:
             raise AcmeException("There is no challenge to respond to!")
@@ -534,12 +540,11 @@ class AcmeAuthorization:
         for i in range(max_retries):
             time.sleep(poll_interval)
             response = self.client._post_as_get(url=self.authorization_url, kid=self.client.kid).json()
-            logger.log("{} Response: {}".format(i, response))
             if response["status"] in ["valid", "invalid"]:
                 logger.log("Authorization is {}".format(response["status"]))
                 auth_done = True
                 if response["status"] != "valid":
-                    raise AcmeException("Authorization invalid!")
+                    raise AcmeInvalidAuthorization("Authorization invalid!")
                 break
         if not auth_done:
             raise AcmeException("Failed to authorize!")
@@ -808,7 +813,7 @@ if __name__ == "__main__":
         client = AcmeClient(acme_directory_url, Jose("ES256"))
         client.create_account()
         client.create_order(domains_to_be_ordered=domains)
-        cert = client.process_orders(challenge_type=challenge_type, csrs=[csr])[0]
+        cert = client.process_orders(challenge_type=challenge_type, csr=csr)
         with open("cert.pem", "wb") as f:
             f.write(cert.public_bytes(serialization.Encoding.PEM))
         certificate_https_server.socket = ssl.wrap_socket(certificate_https_server.socket,
